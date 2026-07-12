@@ -1,0 +1,25 @@
+[package]
+name = "codex-openai-gateway"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-stream = "0.3"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros"] }
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+http = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tower-http = { version = "0.6", features = ["catch-panic", "limit", "request-id", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

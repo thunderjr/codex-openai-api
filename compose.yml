@@ -1,0 +1,28 @@
+services:
+  codex-gateway:
+    build:
+      context: .
+      args:
+        CODEX_VERSION: ${CODEX_VERSION}
+    ports:
+      - "8989:8989"
+    environment:
+      CODEX_HOME: /home/codex/.codex
+      CODEX_DEFAULT_MODEL: ${CODEX_DEFAULT_MODEL}
+      CODEX_EXEC_FALLBACK: ${CODEX_EXEC_FALLBACK:-true}
+      RUST_LOG: ${RUST_LOG:-info}
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 8989
+      SSL_CERT_FILE: /etc/ssl/certs/host-ca-certificates.crt
+    volumes:
+      - ${HOME}/.codex:/home/codex/.codex
+      - ${HOST_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/host-ca-certificates.crt:ro
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    restart: unless-stopped
+    networks:
+      - external
+
+networks:
+  external:
+    external: true
+    name: ${DOCKER_NETWORK:-homelab}
