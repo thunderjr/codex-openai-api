@@ -192,6 +192,9 @@ pub struct CodexRun {
 pub trait CodexBackend: Send + Sync {
     async fn execute(&self, request: CodexRequest) -> Result<CodexRun, GatewayError>;
     fn ready(&self) -> bool;
+    /// Terminate every process this backend spawned. Called on gateway shutdown
+    /// so no orphaned Codex app-servers or code-mode hosts are left behind.
+    async fn shutdown(&self) {}
 }
 
 #[derive(Clone)]
@@ -1033,6 +1036,9 @@ async fn run_worker(
                     Err(error) => {
                         tracing::warn!(worker, error = %error, "thread/start send failed, killing child and reconnecting");
                         fail_active(worker, &mut queue, error).await;
+                        if let Some(pid) = current_connection.child.id() {
+                            kill_subtree(pid, true);
+                        }
                         let _ = current_connection.child.kill().await;
                         connection = None;
                         continue;
@@ -1082,7 +1088,10 @@ async fn run_worker(
             queue.pop_front();
         }
         if connection_failed {
-            tracing::warn!(worker, "killing app-server child before reconnect");
+            tracing::warn!(worker, "killing app-server child tree before reconnect");
+            if let Some(pid) = current_connection.child.id() {
+                kill_subtree(pid, true);
+            }
             let _ = current_connection.child.kill().await;
             connection = None;
         } else {
@@ -1112,11 +1121,72 @@ impl CodexBackend for AppServerBackend {
             .iter()
             .any(|ready| ready.try_read().map(|value| *value).unwrap_or(false))
     }
+    async fn shutdown(&self) {
+        // Every worker child, the real app-server binaries they spawn, and the
+        // code-mode hosts under those are all descendants of this process, so a
+        // single subtree sweep from our own pid reaps the entire pool without
+        // touching the gateway itself.
+        let count = self.ready.len();
+        tracing::info!(pool_size = count, "shutting down: killing app-server process subtree");
+        kill_subtree(std::process::id(), false);
+    }
 }
 fn next_id() -> u64 {
     static NEXT_ID: AtomicU64 = AtomicU64::new(2);
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
+/// SIGKILL `root` and/or all of its transitive descendants.
+///
+/// The Codex npm launcher is a `node` shim that spawns the real app-server
+/// binary as a separate child, which in turn spawns a `codex-code-mode-host`
+/// that detaches into its own process group. A plain SIGKILL of the shim (what
+/// `Child::kill`/`kill_on_drop` does) reaches none of those, orphaning them to
+/// init. We therefore enumerate the whole tree from a single `/proc` snapshot
+/// *before* signalling — so descendants that reparent mid-teardown are still
+/// captured — then kill leaves-first so a parent can't fork more children while
+/// we tear it down.
+#[cfg(unix)]
+fn kill_subtree(root: u32, include_root: bool) {
+    use std::collections::HashMap;
+    fn read_ppid(pid: u32) -> Option<u32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // Format: `pid (comm) state ppid ...`. `comm` may contain spaces or
+        // parentheses, so parse the fields after the final ')'.
+        let rest = stat.rsplit_once(')')?.1;
+        rest.split_whitespace().nth(1)?.parse().ok()
+    }
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            if let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() {
+                if let Some(ppid) = read_ppid(pid) {
+                    children.entry(ppid).or_default().push(pid);
+                }
+            }
+        }
+    }
+    let mut victims = Vec::new();
+    let mut stack = vec![root];
+    while let Some(pid) = stack.pop() {
+        if pid != root || include_root {
+            victims.push(pid);
+        }
+        if let Some(kids) = children.get(&pid) {
+            stack.extend(kids);
+        }
+    }
+    // Leaves were pushed after their parents, so reversing kills them first.
+    for pid in victims.into_iter().rev() {
+        // SAFETY: `kill(2)` with a valid pid and SIGKILL; a dead pid just yields ESRCH.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_subtree(_root: u32, _include_root: bool) {}
+
 async fn connect_app_server(config: &Config) -> Result<AppServerConnection, GatewayError> {
     let mut command = Command::new(&config.codex_binary);
     command
@@ -1414,6 +1484,51 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use http::{header, Request};
     use tower::ServiceExt;
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_subtree_reaps_detached_grandchild() {
+        // Mimic the Codex tree: a shim (bash) spawns a child that `setsid`s into
+        // its own session/process group (like codex-code-mode-host). Killing the
+        // shim's PID alone would orphan the grandchild; kill_subtree must not.
+        let mut shim = std::process::Command::new("bash")
+            .args([
+                "-c",
+                "setsid sleep 300 & echo $! > \"$0\"; sleep 300",
+                std::env::temp_dir()
+                    .join(format!("kill_subtree_test_{}", std::process::id()))
+                    .to_str()
+                    .unwrap(),
+            ])
+            .spawn()
+            .expect("spawn shim");
+        let shim_pid = shim.id();
+        let marker = std::env::temp_dir().join(format!("kill_subtree_test_{}", std::process::id()));
+        // Give the shim time to fork the detached grandchild and write its pid.
+        let grandchild_pid = loop {
+            if let Ok(contents) = std::fs::read_to_string(&marker) {
+                if let Ok(pid) = contents.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let alive = |pid: u32| unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+        assert!(alive(shim_pid), "shim should be alive before kill");
+        assert!(alive(grandchild_pid), "grandchild should be alive before kill");
+
+        kill_subtree(shim_pid, true);
+        let _ = shim.wait();
+        // Reap the detached grandchild (reparented to init in tests) if needed.
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert!(!alive(shim_pid), "shim must be dead after kill_subtree");
+        assert!(
+            !alive(grandchild_pid),
+            "detached grandchild must be dead after kill_subtree"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
     struct FakeBackend;
     #[async_trait]
     impl CodexBackend for FakeBackend {

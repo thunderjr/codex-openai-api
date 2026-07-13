@@ -239,6 +239,7 @@ dependencies = [
  "clap",
  "futures",
  "http",
+ "libc",
  "serde",
  "serde_json",
  "thiserror",
