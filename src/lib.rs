@@ -23,7 +23,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::{
@@ -385,6 +385,26 @@ fn escape_transcript_text(text: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
+/// Count image inputs, text inputs, and total input bytes for observability logging.
+/// Byte accounting mirrors `serialize_input`: text lengths plus image URL lengths.
+fn summarize_input(input: &[CodexInput]) -> (usize, usize, usize) {
+    let mut images = 0usize;
+    let mut texts = 0usize;
+    let mut bytes = 0usize;
+    for item in input {
+        match item {
+            CodexInput::Text { text } => {
+                texts += 1;
+                bytes = bytes.saturating_add(text.len());
+            }
+            CodexInput::Image { url, .. } => {
+                images += 1;
+                bytes = bytes.saturating_add(url.len());
+            }
+        }
+    }
+    (images, texts, bytes)
+}
 fn resolve_model(model: Option<&str>, config: &Config) -> Result<String, String> {
     match model {
         Some("codex") => Ok(config.default_model.clone()),
@@ -435,7 +455,20 @@ async fn chat(
             )
         }
     };
-    run_chat(state, request.stream, model, input).await
+    let rid = Uuid::new_v4().simple().to_string();
+    let (images, texts, bytes) = summarize_input(&input);
+    tracing::info!(
+        %rid,
+        endpoint = "chat",
+        model = %model,
+        messages = request.messages.len(),
+        images,
+        texts,
+        bytes,
+        stream = request.stream,
+        "chat request"
+    );
+    run_chat(state, rid, request.stream, model, input).await
 }
 fn json_rejection_response(error: JsonRejection) -> Response {
     let status = error.status();
@@ -458,35 +491,51 @@ fn json_rejection_response(error: JsonRejection) -> Response {
     }
 }
 
-async fn acquire(state: &GatewayState) -> Result<OwnedSemaphorePermit, Response> {
-    state
-        .permits
-        .clone()
-        .try_acquire_owned()
-        .map_err(|error| match error {
-            tokio::sync::TryAcquireError::NoPermits => error_response(
+async fn acquire(state: &GatewayState, rid: &str) -> Result<OwnedSemaphorePermit, Response> {
+    match state.permits.clone().try_acquire_owned() {
+        Ok(permit) => {
+            tracing::info!(
+                %rid,
+                available = state.permits.available_permits(),
+                "permit acquired"
+            );
+            Ok(permit)
+        }
+        Err(tokio::sync::TryAcquireError::NoPermits) => {
+            tracing::warn!(
+                %rid,
+                available = state.permits.available_permits(),
+                "request rejected: too many concurrent requests (429)"
+            );
+            Err(error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 "too many concurrent requests",
                 "rate_limit_error",
                 None,
                 None,
-            ),
-            tokio::sync::TryAcquireError::Closed => error_response(
+            ))
+        }
+        Err(tokio::sync::TryAcquireError::Closed) => {
+            tracing::warn!(%rid, "request rejected: gateway shutting down (503)");
+            Err(error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "gateway is shutting down",
                 "backend_unavailable",
                 None,
                 None,
-            ),
-        })
+            ))
+        }
+    }
 }
 async fn run_chat(
     state: GatewayState,
+    rid: String,
     streaming: bool,
     model: String,
     input: Vec<CodexInput>,
 ) -> Response {
-    let permit = match acquire(&state).await {
+    let started = Instant::now();
+    let permit = match acquire(&state, &rid).await {
         Ok(permit) => permit,
         Err(response) => return response,
     };
@@ -499,8 +548,12 @@ async fn run_chat(
         })
         .await
     {
-        Ok(run) => run,
+        Ok(run) => {
+            tracing::info!(%rid, elapsed_ms = started.elapsed().as_millis(), "backend accepted request");
+            run
+        }
         Err(error) => {
+            tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), error = %error, "backend rejected request");
             return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 error.to_string(),
@@ -515,6 +568,8 @@ async fn run_chat(
         return chat_stream(
             run,
             permit,
+            rid,
+            started,
             id,
             model,
             state.config.max_response_bytes,
@@ -557,15 +612,28 @@ async fn run_chat(
     .await;
     drop(permit);
     match result {
-        Ok(Ok(())) => Json(json!({ "id": id, "object": "chat.completion", "created": now(), "model": model, "choices": [{ "index": 0, "message": { "role": "assistant", "content": text }, "finish_reason": "stop" }] })).into_response(),
-        Ok(Err(error)) => backend_error_response(error),
-        Err(_) => { run.cancel.cancel(); error_response(StatusCode::GATEWAY_TIMEOUT, "request timed out", "timeout_error", None, None) }
+        Ok(Ok(())) => {
+            tracing::info!(%rid, elapsed_ms = started.elapsed().as_millis(), bytes = text.len(), "chat request completed");
+            Json(json!({ "id": id, "object": "chat.completion", "created": now(), "model": model, "choices": [{ "index": 0, "message": { "role": "assistant", "content": text }, "finish_reason": "stop" }] })).into_response()
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), error = %error, "chat request failed");
+            backend_error_response(error)
+        }
+        Err(_) => {
+            tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), "chat request timed out");
+            run.cancel.cancel();
+            error_response(StatusCode::GATEWAY_TIMEOUT, "request timed out", "timeout_error", None, None)
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn chat_stream(
     mut run: CodexRun,
     permit: OwnedSemaphorePermit,
+    rid: String,
+    started: Instant,
     id: String,
     model: String,
     max_bytes: usize,
@@ -573,22 +641,23 @@ fn chat_stream(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = stream! {
         let _permit = permit;
-        let _cancel = CancelOnDrop(run.cancel.clone());
+        let mut guard = CancelOnDrop { cancel: run.cancel.clone(), rid: rid.clone(), started, endpoint: "chat", completed: false };
         let timeout_at = tokio::time::Instant::now() + request_timeout;
+        tracing::info!(%rid, "chat stream started");
         yield Ok(Event::default().json_data(json!({ "id": id, "object": "chat.completion.chunk", "model": model, "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }] })).unwrap());
         let mut total = 0usize;
         loop {
             tokio::select! {
                 event = run.events.recv() => match event {
-                    Some(Ok(CodexEvent::TextDelta(delta))) => { total += delta.len(); if total > max_bytes { run.cancel.cancel(); break; } yield Ok(Event::default().json_data(json!({ "id": id, "object": "chat.completion.chunk", "model": model, "choices": [{ "index": 0, "delta": { "content": delta }, "finish_reason": null }] })).unwrap()); }
-                    Some(Ok(CodexEvent::Completed)) => { yield Ok(Event::default().json_data(json!({ "id": id, "object": "chat.completion.chunk", "model": model, "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] })).unwrap()); yield Ok(Event::default().data("[DONE]")); break; }
-                    None => { yield Ok(sse_error("backend stream ended before completion", "backend_unavailable")); break; }
+                    Some(Ok(CodexEvent::TextDelta(delta))) => { total += delta.len(); if total > max_bytes { run.cancel.cancel(); tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), bytes = total, "chat stream aborted: response exceeded configured limit"); guard.completed = true; break; } yield Ok(Event::default().json_data(json!({ "id": id, "object": "chat.completion.chunk", "model": model, "choices": [{ "index": 0, "delta": { "content": delta }, "finish_reason": null }] })).unwrap()); }
+                    Some(Ok(CodexEvent::Completed)) => { tracing::info!(%rid, elapsed_ms = started.elapsed().as_millis(), bytes = total, "chat stream completed"); guard.completed = true; yield Ok(Event::default().json_data(json!({ "id": id, "object": "chat.completion.chunk", "model": model, "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] })).unwrap()); yield Ok(Event::default().data("[DONE]")); break; }
+                    None => { tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), "chat stream failed: backend ended before completion"); guard.completed = true; yield Ok(sse_error("backend stream ended before completion", "backend_unavailable")); break; }
                     Some(Ok(CodexEvent::Usage { .. })) => {}
-                    Some(Ok(CodexEvent::Failed(message))) => { yield Ok(sse_error(&message, "backend_unavailable")); break; }
-                    Some(Err(error)) => { yield Ok(sse_error(&error.to_string(), "backend_unavailable")); break; }
+                    Some(Ok(CodexEvent::Failed(message))) => { tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), error = %message, "chat stream failed"); guard.completed = true; yield Ok(sse_error(&message, "backend_unavailable")); break; }
+                    Some(Err(error)) => { tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), error = %error, "chat stream failed"); guard.completed = true; yield Ok(sse_error(&error.to_string(), "backend_unavailable")); break; }
                 },
                 _ = tokio::time::sleep(Duration::from_secs(15)) => yield Ok(Event::default().comment("keepalive")),
-                _ = tokio::time::sleep_until(timeout_at) => { yield Ok(sse_error("request timed out", "timeout_error")); break; }
+                _ = tokio::time::sleep_until(timeout_at) => { tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), "chat stream timed out"); guard.completed = true; yield Ok(sse_error("request timed out", "timeout_error")); break; }
             }
         }
         run.cancel.cancel();
@@ -596,10 +665,24 @@ fn chat_stream(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-struct CancelOnDrop(CancellationToken);
+struct CancelOnDrop {
+    cancel: CancellationToken,
+    rid: String,
+    started: Instant,
+    endpoint: &'static str,
+    completed: bool,
+}
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
-        self.0.cancel();
+        self.cancel.cancel();
+        if !self.completed {
+            tracing::warn!(
+                rid = %self.rid,
+                endpoint = self.endpoint,
+                elapsed_ms = self.started.elapsed().as_millis(),
+                "stream dropped before completion (client disconnect)"
+            );
+        }
     }
 }
 fn sse_error(message: &str, kind: &str) -> Event {
@@ -697,7 +780,21 @@ async fn responses(
             )
         }
     };
-    let permit = match acquire(&state).await {
+    let rid = Uuid::new_v4().simple().to_string();
+    let (images, texts, bytes) = summarize_input(&input);
+    tracing::info!(
+        %rid,
+        endpoint = "responses",
+        model = %model,
+        messages = messages.len(),
+        images,
+        texts,
+        bytes,
+        stream = request.stream,
+        "responses request"
+    );
+    let started = Instant::now();
+    let permit = match acquire(&state, &rid).await {
         Ok(permit) => permit,
         Err(response) => return response,
     };
@@ -710,8 +807,12 @@ async fn responses(
         })
         .await
     {
-        Ok(run) => run,
+        Ok(run) => {
+            tracing::info!(%rid, elapsed_ms = started.elapsed().as_millis(), "backend accepted request");
+            run
+        }
         Err(error) => {
+            tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), error = %error, "backend rejected request");
             return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 error.to_string(),
@@ -726,6 +827,8 @@ async fn responses(
         return response_stream(
             run,
             permit,
+            rid,
+            started,
             id,
             model,
             state.config.max_response_bytes,
@@ -767,17 +870,34 @@ async fn responses(
     })
     .await;
     drop(permit);
-    match result { Ok(Ok(())) => Json(json!({ "id": id, "object": "response", "status": "completed", "model": model, "output": [{ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": text }] }] })).into_response(), Ok(Err(error)) => backend_error_response(error), Err(_) => { run.cancel.cancel(); error_response(StatusCode::GATEWAY_TIMEOUT, "request timed out", "timeout_error", None, None) } }
+    match result {
+        Ok(Ok(())) => {
+            tracing::info!(%rid, elapsed_ms = started.elapsed().as_millis(), bytes = text.len(), "responses request completed");
+            Json(json!({ "id": id, "object": "response", "status": "completed", "model": model, "output": [{ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": text }] }] })).into_response()
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), error = %error, "responses request failed");
+            backend_error_response(error)
+        }
+        Err(_) => {
+            tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), "responses request timed out");
+            run.cancel.cancel();
+            error_response(StatusCode::GATEWAY_TIMEOUT, "request timed out", "timeout_error", None, None)
+        }
+    }
 }
+#[allow(clippy::too_many_arguments)]
 fn response_stream(
     mut run: CodexRun,
     permit: OwnedSemaphorePermit,
+    rid: String,
+    started: Instant,
     id: String,
     model: String,
     max_bytes: usize,
     request_timeout: Duration,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = stream! { let _permit = permit; let _cancel = CancelOnDrop(run.cancel.clone()); let timeout_at = tokio::time::Instant::now() + request_timeout; let mut total = 0usize; yield Ok(Event::default().json_data(json!({ "type": "response.created", "response": { "id": id, "object": "response", "status": "in_progress", "model": model } })).unwrap()); loop { tokio::select! { event = run.events.recv() => match event { Some(Ok(CodexEvent::TextDelta(delta))) => { total += delta.len(); if total > max_bytes { run.cancel.cancel(); yield Ok(sse_error("response exceeded configured limit", "backend_unavailable")); break; } yield Ok(Event::default().json_data(json!({ "type": "response.output_text.delta", "delta": delta })).unwrap()); }, Some(Ok(CodexEvent::Completed)) => { yield Ok(Event::default().json_data(json!({ "type": "response.output_text.done" })).unwrap()); yield Ok(Event::default().json_data(json!({ "type": "response.completed" })).unwrap()); break; }, Some(Ok(CodexEvent::Usage { .. })) => {}, Some(Ok(CodexEvent::Failed(message))) => { yield Ok(sse_error(&message, "backend_unavailable")); break; }, Some(Err(error)) => { yield Ok(sse_error(&error.to_string(), "backend_unavailable")); break; }, None => { yield Ok(sse_error("backend stream ended before completion", "backend_unavailable")); break; } }, _ = tokio::time::sleep(Duration::from_secs(15)) => yield Ok(Event::default().comment("keepalive")), _ = tokio::time::sleep_until(timeout_at) => { yield Ok(sse_error("request timed out", "timeout_error")); break; } } } run.cancel.cancel(); };
+    let stream = stream! { let _permit = permit; let mut guard = CancelOnDrop { cancel: run.cancel.clone(), rid: rid.clone(), started, endpoint: "responses", completed: false }; let timeout_at = tokio::time::Instant::now() + request_timeout; let mut total = 0usize; tracing::info!(%rid, "responses stream started"); yield Ok(Event::default().json_data(json!({ "type": "response.created", "response": { "id": id, "object": "response", "status": "in_progress", "model": model } })).unwrap()); loop { tokio::select! { event = run.events.recv() => match event { Some(Ok(CodexEvent::TextDelta(delta))) => { total += delta.len(); if total > max_bytes { run.cancel.cancel(); tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), bytes = total, "responses stream aborted: response exceeded configured limit"); guard.completed = true; yield Ok(sse_error("response exceeded configured limit", "backend_unavailable")); break; } yield Ok(Event::default().json_data(json!({ "type": "response.output_text.delta", "delta": delta })).unwrap()); }, Some(Ok(CodexEvent::Completed)) => { tracing::info!(%rid, elapsed_ms = started.elapsed().as_millis(), bytes = total, "responses stream completed"); guard.completed = true; yield Ok(Event::default().json_data(json!({ "type": "response.output_text.done" })).unwrap()); yield Ok(Event::default().json_data(json!({ "type": "response.completed" })).unwrap()); break; }, Some(Ok(CodexEvent::Usage { .. })) => {}, Some(Ok(CodexEvent::Failed(message))) => { tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), error = %message, "responses stream failed"); guard.completed = true; yield Ok(sse_error(&message, "backend_unavailable")); break; }, Some(Err(error)) => { tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), error = %error, "responses stream failed"); guard.completed = true; yield Ok(sse_error(&error.to_string(), "backend_unavailable")); break; }, None => { tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), "responses stream failed: backend ended before completion"); guard.completed = true; yield Ok(sse_error("backend stream ended before completion", "backend_unavailable")); break; } }, _ = tokio::time::sleep(Duration::from_secs(15)) => yield Ok(Event::default().comment("keepalive")), _ = tokio::time::sleep_until(timeout_at) => { tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), "responses stream timed out"); guard.completed = true; yield Ok(sse_error("request timed out", "timeout_error")); break; } } } run.cancel.cancel(); };
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 fn now() -> u64 {
@@ -803,6 +923,7 @@ struct ActiveRun {
     thread_id: Option<String>,
     turn_id: Option<String>,
     interrupt_sent: bool,
+    turn_started_at: Option<Instant>,
 }
 struct AppServerConnection {
     child: Child,
@@ -810,107 +931,163 @@ struct AppServerConnection {
     lines: FramedRead<ChildStdout, LinesCodec>,
 }
 pub struct AppServerBackend {
+    // Intake channel: `execute()` sends here; a single dispatcher routes each command to an idle worker.
     commands: mpsc::Sender<BackendCommand>,
-    ready: Arc<RwLock<bool>>,
+    // One readiness flag per worker; `ready()` is true if ANY worker holds a live connection.
+    ready: Vec<Arc<RwLock<bool>>>,
     config: Config,
 }
 
 impl AppServerBackend {
     async fn start(config: Config) -> Result<Self, GatewayError> {
-        let (commands, mut receiver) = mpsc::channel(32);
-        let ready = Arc::new(RwLock::new(false));
-        let ready_task = ready.clone();
-        let config_task = config.clone();
-        tokio::spawn(async move {
-            let mut connection: Option<AppServerConnection> = None;
-            let mut queue: VecDeque<ActiveRun> = VecDeque::new();
-            let mut cancellation_tick = tokio::time::interval(Duration::from_millis(100));
-            let mut reconnect_delay = Duration::from_millis(500);
-            loop {
-                if connection.is_none() {
-                    *ready_task.write().await = false;
-                    match connect_app_server(&config_task).await {
-                        Ok(new_connection) => {
-                            connection = Some(new_connection);
-                            reconnect_delay = Duration::from_millis(500);
-                            *ready_task.write().await = true;
-                        }
-                        Err(_) => {
-                            tokio::time::sleep(reconnect_delay).await;
-                            reconnect_delay = reconnect_delay
-                                .saturating_mul(2)
-                                .min(Duration::from_secs(30));
-                            continue;
-                        }
-                    }
-                }
-                let mut current_connection = connection.take().expect("connection established");
-                if let Some(active) = queue.front_mut() {
-                    if !active.thread_sent {
-                        match send_thread_start(&mut current_connection.stdin, active).await {
-                            Ok(()) => active.thread_sent = true,
-                            Err(error) => {
-                                fail_active(&mut queue, error).await;
-                                let _ = current_connection.child.kill().await;
-                                connection = None;
-                                continue;
-                            }
-                        }
-                    }
-                }
-                let mut connection_failed = false;
-                tokio::select! {
-                    command = receiver.recv() => match command {
-                        Some(BackendCommand::Execute(request, reply)) => { let (events, event_receiver) = mpsc::channel(32); let cancel = CancellationToken::new(); let run = CodexRun { events: event_receiver, cancel: cancel.clone() }; let active = ActiveRun { request, events, cancel, thread_request_id: next_id(), thread_sent: false, turn_request_id: None, thread_id: None, turn_id: None, interrupt_sent: false }; queue.push_back(active); let _ = reply.send(Ok(run)); }
-                        None => break,
-                    },
-                    line = current_connection.lines.next() => match line {
-                        Some(Ok(line)) => { if let Err(error) = handle_server_line(&mut current_connection.stdin, &mut queue, &line).await { fail_active(&mut queue, error).await; connection_failed = true; } }
-                        Some(Err(error)) => { fail_active(&mut queue, GatewayError::Backend(error.to_string())).await; connection_failed = true; }
-                        None => { fail_active(&mut queue, GatewayError::Unavailable).await; connection_failed = true; }
-                    },
-                    _ = cancellation_tick.tick() => {
-                        // A canceled queued request must never later reach Codex. For the
-                        // running request, keep its routing state until turn/completed.
-                        let mut position = 1;
-                        while position < queue.len() {
-                            if queue[position].cancel.is_cancelled() {
-                                if let Some(active) = queue.remove(position) {
-                                    let _ = active.events.send(Err(GatewayError::Timeout)).await;
-                                }
-                            } else {
-                                position += 1;
-                            }
-                        }
-                        if let Some(active) = queue.front_mut() {
-                            if active.cancel.is_cancelled() && !active.interrupt_sent && active.thread_id.is_some() && active.turn_id.is_some() {
-                                match send_interrupt(&mut current_connection.stdin, active.thread_id.clone(), active.turn_id.clone()).await {
-                                    Ok(()) => active.interrupt_sent = true,
-                                    Err(error) => { fail_active(&mut queue, error).await; connection_failed = true; }
-                                }
-                            }
-                        }
-                    },
-                }
-                if queue
-                    .front()
-                    .is_some_and(|active| active.turn_request_id == Some(0))
-                {
-                    queue.pop_front();
-                }
-                if connection_failed {
-                    let _ = current_connection.child.kill().await;
-                    connection = None;
-                } else {
-                    connection = Some(current_connection);
-                }
-            }
-        });
+        // Pool of `max_concurrent_runs` workers, each owning one serial app-server child.
+        // N children give N-way concurrency since a single child serializes its turns.
+        let pool_size = config.max_concurrent_runs;
+        tracing::info!(pool_size, "starting app-server worker pool");
+        let (commands, commands_rx) = mpsc::channel(32);
+        let (idle_tx, idle_rx) = mpsc::unbounded_channel::<usize>();
+        let mut worker_senders: Vec<mpsc::Sender<BackendCommand>> = Vec::with_capacity(pool_size);
+        let mut ready = Vec::with_capacity(pool_size);
+        for worker in 0..pool_size {
+            let (sender, receiver) = mpsc::channel(1);
+            worker_senders.push(sender);
+            let ready_flag = Arc::new(RwLock::new(false));
+            ready.push(ready_flag.clone());
+            tokio::spawn(run_worker(
+                worker,
+                config.clone(),
+                receiver,
+                ready_flag,
+                idle_tx.clone(),
+            ));
+        }
+        tokio::spawn(dispatch(commands_rx, idle_rx, worker_senders));
         Ok(Self {
             commands,
             ready,
             config,
         })
+    }
+}
+// Hands each intake command to an idle worker. Recv the command FIRST, then an idle worker index:
+// because a permit is held before `execute()` (in-flight <= N) and there are N workers, an idle
+// worker is always available or imminently freed, so this never deadlocks. Do NOT reorder.
+async fn dispatch(
+    mut commands: mpsc::Receiver<BackendCommand>,
+    mut idle: mpsc::UnboundedReceiver<usize>,
+    workers: Vec<mpsc::Sender<BackendCommand>>,
+) {
+    while let Some(command) = commands.recv().await {
+        let Some(worker) = idle.recv().await else {
+            break;
+        };
+        let _ = workers[worker].send(command).await;
+    }
+}
+// One worker owns one app-server child and runs the per-connection actor loop for a single active
+// run at a time. It registers itself as idle (once after a (re)connect with no active run, and again
+// each time it finishes a run and its queue is empty), guarded by `is_idle` to avoid double-registering.
+async fn run_worker(
+    worker: usize,
+    config: Config,
+    mut receiver: mpsc::Receiver<BackendCommand>,
+    ready: Arc<RwLock<bool>>,
+    idle: mpsc::UnboundedSender<usize>,
+) {
+    let mut connection: Option<AppServerConnection> = None;
+    let mut queue: VecDeque<ActiveRun> = VecDeque::new();
+    let mut cancellation_tick = tokio::time::interval(Duration::from_millis(100));
+    let mut reconnect_delay = Duration::from_millis(500);
+    let mut is_idle = false;
+    loop {
+        if connection.is_none() {
+            *ready.write().await = false;
+            match connect_app_server(&config).await {
+                Ok(new_connection) => {
+                    connection = Some(new_connection);
+                    reconnect_delay = Duration::from_millis(500);
+                    *ready.write().await = true;
+                    tracing::info!(worker, "app-server connection established");
+                }
+                Err(error) => {
+                    tracing::warn!(worker, error = %error, backoff_ms = reconnect_delay.as_millis(), "app-server connect failed, backing off before reconnect");
+                    tokio::time::sleep(reconnect_delay).await;
+                    reconnect_delay = reconnect_delay
+                        .saturating_mul(2)
+                        .min(Duration::from_secs(30));
+                    continue;
+                }
+            }
+        }
+        // Announce availability so the dispatcher can route a command here.
+        if queue.is_empty() && !is_idle {
+            let _ = idle.send(worker);
+            is_idle = true;
+            tracing::debug!(worker, "worker idle, registered for dispatch");
+        }
+        let mut current_connection = connection.take().expect("connection established");
+        if let Some(active) = queue.front_mut() {
+            if !active.thread_sent {
+                match send_thread_start(&mut current_connection.stdin, worker, active).await {
+                    Ok(()) => active.thread_sent = true,
+                    Err(error) => {
+                        tracing::warn!(worker, error = %error, "thread/start send failed, killing child and reconnecting");
+                        fail_active(worker, &mut queue, error).await;
+                        let _ = current_connection.child.kill().await;
+                        connection = None;
+                        continue;
+                    }
+                }
+            }
+        }
+        let mut connection_failed = false;
+        tokio::select! {
+            command = receiver.recv() => match command {
+                Some(BackendCommand::Execute(request, reply)) => { is_idle = false; let (events, event_receiver) = mpsc::channel(32); let cancel = CancellationToken::new(); let run = CodexRun { events: event_receiver, cancel: cancel.clone() }; let (images, texts, bytes) = summarize_input(&request.input); let model = request.model.clone(); let active = ActiveRun { request, events, cancel, thread_request_id: next_id(), thread_sent: false, turn_request_id: None, thread_id: None, turn_id: None, interrupt_sent: false, turn_started_at: None }; queue.push_back(active); tracing::info!(worker, queue_len = queue.len(), model = %model, images, texts, bytes, "backend queued execute command"); let _ = reply.send(Ok(run)); }
+                None => break,
+            },
+            line = current_connection.lines.next() => match line {
+                Some(Ok(line)) => { if let Err(error) = handle_server_line(&mut current_connection.stdin, worker, &mut queue, &line).await { tracing::warn!(worker, error = %error, "app-server line handling failed, failing active runs and reconnecting"); fail_active(worker, &mut queue, error).await; connection_failed = true; } }
+                Some(Err(error)) => { tracing::warn!(worker, error = %error, "app-server line stream error, failing active runs and reconnecting"); fail_active(worker, &mut queue, GatewayError::Backend(error.to_string())).await; connection_failed = true; }
+                None => { tracing::warn!(worker, "app-server stdout closed (EOF), failing active runs and reconnecting"); fail_active(worker, &mut queue, GatewayError::Unavailable).await; connection_failed = true; }
+            },
+            _ = cancellation_tick.tick() => {
+                // A canceled queued request must never later reach Codex. For the
+                // running request, keep its routing state until turn/completed.
+                let mut position = 1;
+                while position < queue.len() {
+                    if queue[position].cancel.is_cancelled() {
+                        if let Some(active) = queue.remove(position) {
+                            let _ = active.events.send(Err(GatewayError::Timeout)).await;
+                        }
+                    } else {
+                        position += 1;
+                    }
+                }
+                if let Some(active) = queue.front_mut() {
+                    if active.cancel.is_cancelled() && !active.interrupt_sent && active.thread_id.is_some() && active.turn_id.is_some() {
+                        tracing::info!(worker, thread_id = ?active.thread_id, turn_id = ?active.turn_id, "sending turn/interrupt for cancelled request");
+                        match send_interrupt(&mut current_connection.stdin, active.thread_id.clone(), active.turn_id.clone()).await {
+                            Ok(()) => active.interrupt_sent = true,
+                            Err(error) => { tracing::warn!(worker, error = %error, "turn/interrupt send failed, failing active runs and reconnecting"); fail_active(worker, &mut queue, error).await; connection_failed = true; }
+                        }
+                    }
+                }
+            },
+        }
+        if queue
+            .front()
+            .is_some_and(|active| active.turn_request_id == Some(0))
+        {
+            queue.pop_front();
+        }
+        if connection_failed {
+            tracing::warn!(worker, "killing app-server child before reconnect");
+            let _ = current_connection.child.kill().await;
+            connection = None;
+        } else {
+            connection = Some(current_connection);
+        }
     }
 }
 #[async_trait]
@@ -931,7 +1108,9 @@ impl CodexBackend for AppServerBackend {
         receiver.await.map_err(|_| GatewayError::Unavailable)?
     }
     fn ready(&self) -> bool {
-        self.ready.try_read().map(|value| *value).unwrap_or(false)
+        self.ready
+            .iter()
+            .any(|ready| ready.try_read().map(|value| *value).unwrap_or(false))
     }
 }
 fn next_id() -> u64 {
@@ -984,10 +1163,12 @@ async fn write_json(stdin: &mut ChildStdin, value: Value) -> Result<(), GatewayE
 }
 async fn send_thread_start(
     stdin: &mut ChildStdin,
+    worker: usize,
     active: &mut ActiveRun,
 ) -> Result<(), GatewayError> {
     // Keep this local-only gateway from granting model-invoked tools broad write or
     // network access. No client-controlled sandbox/workspace setting is exposed.
+    tracing::info!(worker, thread_request_id = active.thread_request_id, model = %active.request.model, "sending thread/start");
     write_json(stdin, json!({ "method": "thread/start", "id": active.thread_request_id, "params": { "model": active.request.model, "ephemeral": true, "sandbox": "read-only" } })).await
 }
 async fn send_interrupt(
@@ -1002,6 +1183,7 @@ async fn send_interrupt(
 }
 async fn handle_server_line(
     stdin: &mut ChildStdin,
+    worker: usize,
     queue: &mut VecDeque<ActiveRun>,
     line: &str,
 ) -> Result<(), GatewayError> {
@@ -1019,6 +1201,9 @@ async fn handle_server_line(
         active.thread_id = Some(thread_id.clone());
         let turn_id = next_id();
         active.turn_request_id = Some(turn_id);
+        let (images, texts, bytes) = summarize_input(&active.request.input);
+        tracing::info!(worker, thread_id = %thread_id, turn_request_id = turn_id, model = %active.request.model, images, texts, bytes, "thread id received, sending turn/start");
+        active.turn_started_at = Some(Instant::now());
         write_json(stdin, json!({ "method": "turn/start", "id": turn_id, "params": { "threadId": thread_id, "model": active.request.model, "sandboxPolicy": { "type": "readOnly", "networkAccess": false }, "input": active.request.input } })).await?;
     } else if active.turn_request_id.is_some()
         && value.get("id").and_then(Value::as_u64) == active.turn_request_id
@@ -1040,6 +1225,7 @@ async fn handle_server_line(
         }
         if method == "item/agentMessage/delta" {
             if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                tracing::debug!(worker, thread_id = ?active.thread_id, delta_bytes = delta.len(), "agentMessage delta");
                 // A client disconnect is normal: cancellation is handled by the actor,
                 // rather than treating a closed event receiver as a protocol failure.
                 let _ = active
@@ -1049,6 +1235,16 @@ async fn handle_server_line(
             }
         }
         if method == "turn/completed" {
+            let turn_elapsed_ms = active
+                .turn_started_at
+                .map(|start| start.elapsed().as_millis());
+            let status = params
+                .pointer("/turn/status")
+                .and_then(Value::as_str)
+                .unwrap_or("<none>");
+            let input_tokens = params.pointer("/usage/inputTokens").and_then(Value::as_u64);
+            let output_tokens = params.pointer("/usage/outputTokens").and_then(Value::as_u64);
+            tracing::info!(worker, thread_id = ?active.thread_id, turn_id = ?active.turn_id, status, ?input_tokens, ?output_tokens, ?turn_elapsed_ms, "turn/completed");
             if let Some(usage) = params.get("usage") {
                 let _ = active
                     .events
@@ -1089,10 +1285,13 @@ async fn handle_server_line(
     }
     Ok(())
 }
-async fn fail_active(queue: &mut VecDeque<ActiveRun>, error: GatewayError) {
+async fn fail_active(worker: usize, queue: &mut VecDeque<ActiveRun>, error: GatewayError) {
+    let mut failed = 0usize;
     while let Some(active) = queue.pop_front() {
         let _ = active.events.send(Err(error.clone())).await;
+        failed += 1;
     }
+    tracing::warn!(worker, failed, error = %error, "drained and failed queued runs");
 }
 
 struct ExecBackend;
@@ -1383,7 +1582,7 @@ mod tests {
         limited.max_concurrent_runs = 1;
         let state = GatewayState::with_backend(limited, Arc::new(FakeBackend));
         let _permit = state.permits.clone().try_acquire_owned().unwrap();
-        let response = acquire(&state).await.unwrap_err();
+        let response = acquire(&state, "test").await.unwrap_err();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
     struct FailedBackend;
@@ -1552,5 +1751,62 @@ mod tests {
             }
         }
         assert_eq!(text, "fake response");
+    }
+    #[tokio::test]
+    async fn pool_serves_requests_concurrently() {
+        // Two workers, each with a slow fake child that holds a turn open for ~600ms.
+        // Two runs dispatched to distinct workers must overlap, so both individually
+        // take the full delay yet together finish in well under their combined time.
+        let mut config = config();
+        config.max_concurrent_runs = 2;
+        config.exec_fallback = false;
+        config.codex_binary = format!("{}/tests/fake_codex_slow.sh", env!("CARGO_MANIFEST_DIR"));
+        let backend = AppServerBackend::start(config).await.unwrap();
+        for _ in 0..200 {
+            if backend.ready() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(backend.ready());
+        // Settle so BOTH workers finish connecting (ready() only requires one).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let make_request = || CodexRequest {
+            model: "gpt-5.4-mini".into(),
+            input: vec![CodexInput::Text { text: "hi".into() }],
+            timeout: Duration::from_secs(10),
+        };
+        async fn drain(mut run: CodexRun) -> (String, Duration) {
+            let started = Instant::now();
+            let mut text = String::new();
+            while let Some(event) = run.events.recv().await {
+                match event.unwrap() {
+                    CodexEvent::TextDelta(delta) => text.push_str(&delta),
+                    CodexEvent::Completed => break,
+                    _ => {}
+                }
+            }
+            (text, started.elapsed())
+        }
+
+        let started = Instant::now();
+        // Fire both without awaiting the first to completion; each lands on a distinct worker.
+        let run1 = backend.execute(make_request()).await.unwrap();
+        let run2 = backend.execute(make_request()).await.unwrap();
+        let handle1 = tokio::spawn(drain(run1));
+        let handle2 = tokio::spawn(drain(run2));
+        let (text1, elapsed1) = handle1.await.unwrap();
+        let (text2, elapsed2) = handle2.await.unwrap();
+        let total = started.elapsed();
+
+        assert_eq!(text1, "fake response");
+        assert_eq!(text2, "fake response");
+        // Each run genuinely waited out the ~600ms turn delay...
+        assert!(elapsed1 >= Duration::from_millis(500), "run1 too fast: {elapsed1:?}");
+        assert!(elapsed2 >= Duration::from_millis(500), "run2 too fast: {elapsed2:?}");
+        // ...yet the two together finished in less than their sum, which is only
+        // possible if they ran on separate children concurrently (serial would be ~1200ms).
+        assert!(total < Duration::from_millis(1000), "runs did not overlap: {total:?}");
     }
 }

@@ -10,6 +10,8 @@ services:
       CODEX_HOME: /home/codex/.codex
       CODEX_DEFAULT_MODEL: ${CODEX_DEFAULT_MODEL}
       CODEX_EXEC_FALLBACK: ${CODEX_EXEC_FALLBACK:-true}
+      CODEX_MAX_REQUEST_BODY_BYTES: ${CODEX_MAX_REQUEST_BODY_BYTES:-20971520}
+      CODEX_MAX_PROMPT_BYTES: ${CODEX_MAX_PROMPT_BYTES:-16777216}
       RUST_LOG: ${RUST_LOG:-info}
       SERVER_HOST: 0.0.0.0
       SERVER_PORT: 8989
@@ -25,4 +27,4 @@ services:
 networks:
   external:
     external: true
-    name: ${DOCKER_NETWORK:-homelab}
+    name: ${DOCKER_NETWORK:-${HOMELAB_NETWORK:-homelab}}
