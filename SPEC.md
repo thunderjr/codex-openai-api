@@ -166,7 +166,7 @@ Example internal request:
   "method": "thread/start",
   "id": 1,
   "params": {
-    "model": "gpt-5.6"
+    "model": "gpt-5.6-luna"
   }
 }
 ```
@@ -255,11 +255,11 @@ Example:
       "object": "model",
       "owned_by": "openai"
     },
-    {
-      "id": "gpt-5.6",
-      "object": "model",
-      "owned_by": "openai"
-    }
+    { "id": "gpt-5.4-mini", "object": "model", "owned_by": "openai" },
+    { "id": "gpt-5.5", "object": "model", "owned_by": "openai" },
+    { "id": "gpt-5.6-luna", "object": "model", "owned_by": "openai" },
+    { "id": "gpt-5.6-terra", "object": "model", "owned_by": "openai" },
+    { "id": "gpt-5.6-sol", "object": "model", "owned_by": "openai" }
   ]
 }
 ```
@@ -336,7 +336,7 @@ Do not accept any custom `codex`, `workspace`, `cwd`, `sandbox`, or `thread_id` 
 
 ## Message content
 
-Initially support string content:
+Support string content:
 
 ```json
 {
@@ -345,7 +345,7 @@ Initially support string content:
 }
 ```
 
-Also support OpenAI-style text content arrays:
+Also support OpenAI-style text and image content arrays:
 
 ```json
 {
@@ -359,7 +359,7 @@ Also support OpenAI-style text content arrays:
 }
 ```
 
-Reject unsupported image, audio, or file inputs with a structured error unless they can be handled correctly.
+Image parts use Chat Completions `image_url` or Responses `input_image` shapes and are forwarded as app-server `{ "type": "image", "url": "..." }` input items. Accept HTTPS and image data URLs; do not accept public filesystem paths. Reject audio, generic files, and unresolved Files API `file_id` references with a structured error.
 
 Supported roles:
 
@@ -1127,8 +1127,8 @@ CODEX_RUNTIME_DIR=/home/codex/runtime
 CODEX_EXEC_FALLBACK=true
 CODEX_REQUEST_TIMEOUT_SECONDS=600
 CODEX_MAX_CONCURRENT_RUNS=4
-CODEX_MAX_REQUEST_BODY_BYTES=1048576
-CODEX_MAX_PROMPT_BYTES=524288
+CODEX_MAX_REQUEST_BODY_BYTES=20971520
+CODEX_MAX_PROMPT_BYTES=16777216
 RUST_LOG=info
 SERVER_HOST=0.0.0.0
 SERVER_PORT=8989

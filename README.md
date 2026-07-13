@@ -48,9 +48,42 @@ The repository also includes a dependency-free `uv` client:
 uv run scripts/codex_client.py "Explain bounded Tokio channels."
 uv run scripts/codex_client.py --stream "Write a short haiku about containers."
 uv run scripts/codex_client.py --responses "Explain Rust ownership."
+uv run scripts/codex_client.py --image ./screenshot.png "What is wrong in this screenshot?"
 ```
 
-The supported subset is text messages, roles `system`, `developer`, `user`, and `assistant`, model alias `codex`, `stream`, and common harmless generation fields. Image/audio/file content and unsupported models are rejected. Usage is omitted when unavailable.
+The supported subset includes text and image inputs, roles `system`, `developer`, `user`, and `assistant`, model alias `codex`, `stream`, and common harmless generation fields. Enabled models are `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-terra`, and `gpt-5.6-sol`; `codex` resolves to `CODEX_DEFAULT_MODEL`. Images may be HTTPS URLs or `data:image/...` URLs. The gateway forwards them to `turn/start.input` as Codex app-server image items; it never exposes or accepts a host path. Audio, generic files, image `file_id` references, and unsupported models are rejected. Usage is omitted when unavailable.
+
+Chat Completions uses the standard `image_url` part:
+
+```json
+{
+  "model": "codex",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "Describe this image."},
+      {"type": "image_url", "image_url": {"url": "data:image/png;base64,...", "detail": "high"}}
+    ]
+  }]
+}
+```
+
+Responses uses `input_image`:
+
+```json
+{
+  "model": "codex",
+  "input": [{
+    "role": "user",
+    "content": [
+      {"type": "input_text", "text": "Describe this image."},
+      {"type": "input_image", "image_url": "https://example.com/image.png", "detail": "auto"}
+    ]
+  }]
+}
+```
+
+Codex app-server currently has `text`, `image`, and `localImage` user-input variants, but no generic file variant. Consequently this gateway cannot faithfully forward PDFs or other `input_file` attachments. Add a Files API plus an extraction/file-search strategy before advertising generic file support.
 
 OpenAI Python SDK usage only changes the base URL:
 
@@ -77,4 +110,4 @@ Run checks with `cargo fmt --check`, `cargo clippy --all-targets --all-features 
 
 If `/ready` returns `503`, inspect the container logs for a Codex startup or authentication problem and confirm that the host's `${HOME}/.codex` directory is mounted. The gateway does not print credentials or child stderr in HTTP responses. To verify a pinned CLI's exact app-server schema, run `codex app-server generate-json-schema --out /tmp/codex-schema` with that same CLI version.
 
-Known limitations: this v1 adapter does not persist conversations, expose project files, provide accurate token usage, or replay failed turns. It supports a minimal text-only Responses API subset. Streaming request deadlines and disconnected clients cooperatively interrupt the active app-server turn; an interrupted or failed Codex turn is returned as an error rather than a successful completion.
+Known limitations: this v1 adapter does not persist conversations, expose project files, accept generic file attachments, provide accurate token usage, or replay failed turns. Streaming request deadlines and disconnected clients cooperatively interrupt the active app-server turn; an interrupted or failed Codex turn is returned as an error rather than a successful completion. Image requests require the app-server backend; the text-only `codex exec` fallback rejects them.
