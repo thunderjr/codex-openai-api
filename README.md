@@ -102,7 +102,9 @@ This local-only build has no gateway authentication; `/health`, `/ready`, and `/
 
 ## Configuration and operations
 
-Required for Compose: `CODEX_DEFAULT_MODEL` and pinned `CODEX_VERSION`. Optional settings include `CODEX_BINARY`, `CODEX_HOME`, `CODEX_RUNTIME_DIR`, `CODEX_EXEC_FALLBACK`, request timeout, concurrency, body/prompt/response limits, `SERVER_HOST`, `SERVER_PORT`, and `RUST_LOG`. The app-server is the primary backend; `codex exec --json -` is an internal fallback when startup is unavailable. Concurrency saturation returns HTTP 429 instead of retaining unbounded queued requests.
+Required for Compose: `CODEX_DEFAULT_MODEL` and pinned `CODEX_VERSION`. Optional settings include `CODEX_BINARY`, `CODEX_HOME`, `CODEX_RUNTIME_DIR`, `CODEX_EXEC_FALLBACK`, `CODEX_APP_SERVER_MAX_TURNS`, request timeout, concurrency, body/prompt/response limits, `SERVER_HOST`, `SERVER_PORT`, and `RUST_LOG`. The app-server is the primary backend; `codex exec --json -` is an internal fallback when startup is unavailable. Concurrency saturation returns HTTP 429 instead of retaining unbounded queued requests.
+
+The gateway keeps a pool of `CODEX_MAX_CONCURRENT_RUNS` persistent `codex app-server` children. Because the native app-server process accumulates memory across the turns it serves and never releases it while alive, each child is recycled after `CODEX_APP_SERVER_MAX_TURNS` turns (default `100`): while idle between runs the worker kills that child's process subtree and reconnects a fresh one, bounding the pool's resident memory. The recycle happens only between turns, never mid-turn, and the remaining pool workers keep `/ready` serving during the brief reconnect. Set `CODEX_APP_SERVER_MAX_TURNS=0` to disable recycling and keep every child alive for the whole process (the previous unbounded behavior).
 
 Run checks with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all`. Real Codex smoke tests require valid host authentication; automated tests must use a fake Codex executable and never consume real usage.
 

@@ -62,6 +62,12 @@ pub struct Config {
     pub timeout_seconds: u64,
     #[arg(long, env = "CODEX_MAX_CONCURRENT_RUNS", default_value_t = 4)]
     pub max_concurrent_runs: usize,
+    /// Recycle each pooled `codex app-server` child after it has served this many
+    /// turns, reclaiming the memory the native process accumulates over its life.
+    /// The child is only recycled while idle between runs, never mid-turn. Set to
+    /// `0` to disable recycling and keep every child alive for the whole process.
+    #[arg(long, env = "CODEX_APP_SERVER_MAX_TURNS", default_value_t = 100)]
+    pub app_server_max_turns: u64,
     #[arg(
         long,
         env = "CODEX_MAX_REQUEST_BODY_BYTES",
@@ -1002,6 +1008,10 @@ async fn run_worker(
     let mut cancellation_tick = tokio::time::interval(Duration::from_millis(100));
     let mut reconnect_delay = Duration::from_millis(500);
     let mut is_idle = false;
+    // Turns served by the CURRENT child; reset on every (re)connect. When it
+    // reaches `max_turns` the child is recycled to bound its memory growth.
+    let max_turns = config.app_server_max_turns;
+    let mut turns_served: u64 = 0;
     loop {
         if connection.is_none() {
             *ready.write().await = false;
@@ -1009,6 +1019,7 @@ async fn run_worker(
                 Ok(new_connection) => {
                     connection = Some(new_connection);
                     reconnect_delay = Duration::from_millis(500);
+                    turns_served = 0;
                     *ready.write().await = true;
                     tracing::info!(worker, "app-server connection established");
                 }
@@ -1081,14 +1092,29 @@ async fn run_worker(
                 }
             },
         }
+        let mut run_completed = false;
         if queue
             .front()
             .is_some_and(|active| active.turn_request_id == Some(0))
         {
             queue.pop_front();
+            run_completed = true;
+            turns_served += 1;
         }
         if connection_failed {
             tracing::warn!(worker, "killing app-server child tree before reconnect");
+            if let Some(pid) = current_connection.child.id() {
+                kill_subtree(pid, true);
+            }
+            let _ = current_connection.child.kill().await;
+            connection = None;
+        } else if run_completed && max_turns > 0 && turns_served >= max_turns && queue.is_empty() {
+            // Recycle the child now that it is idle: the native `codex app-server`
+            // process accumulates memory across turns and never releases it while
+            // alive, so killing it here and reconnecting a fresh one on the next
+            // loop iteration bounds the pool's footprint. Reconnecting resets the
+            // readiness flag briefly, but the other pool workers keep `ready()` true.
+            tracing::info!(worker, turns_served, max_turns, "recycling app-server child after reaching turn budget");
             if let Some(pid) = current_connection.child.id() {
                 kill_subtree(pid, true);
             }
@@ -1557,6 +1583,7 @@ mod tests {
             exec_fallback: false,
             timeout_seconds: 1,
             max_concurrent_runs: 2,
+            app_server_max_turns: 0,
             max_request_body_bytes: 1_048_576,
             max_prompt_bytes: 512,
             max_response_bytes: 512,
@@ -1923,5 +1950,72 @@ mod tests {
         // ...yet the two together finished in less than their sum, which is only
         // possible if they ran on separate children concurrently (serial would be ~1200ms).
         assert!(total < Duration::from_millis(1000), "runs did not overlap: {total:?}");
+    }
+    #[tokio::test]
+    async fn app_server_child_is_recycled_after_turn_budget() {
+        // One worker recycled every 3 turns. Each spawned child records its PID
+        // via the fake, so serving more turns than the budget must produce more
+        // than one distinct PID — proving the long-lived child is torn down and
+        // replaced instead of accumulating memory forever.
+        static UNIQUE: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "codex_recycle_{}_{}",
+            std::process::id(),
+            UNIQUE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pids_file = dir.join("pids");
+
+        let mut config = config();
+        config.max_concurrent_runs = 1;
+        config.exec_fallback = false;
+        config.app_server_max_turns = 3;
+        config.timeout_seconds = 10;
+        config.codex_home = dir.to_str().unwrap().to_string();
+        config.codex_binary = format!("{}/tests/fake_codex_pid.sh", env!("CARGO_MANIFEST_DIR"));
+        let backend = AppServerBackend::start(config).await.unwrap();
+        for _ in 0..200 {
+            if backend.ready() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(backend.ready());
+
+        // Seven turns with a budget of three: child #1 serves 3 then recycles,
+        // child #2 serves 3 then recycles, child #3 serves the last one.
+        for _ in 0..7 {
+            let mut run = backend
+                .execute(CodexRequest {
+                    model: "gpt-5.4-mini".into(),
+                    input: vec![CodexInput::Text { text: "hi".into() }],
+                    timeout: Duration::from_secs(10),
+                })
+                .await
+                .unwrap();
+            let mut text = String::new();
+            while let Some(event) = run.events.recv().await {
+                match event.unwrap() {
+                    CodexEvent::TextDelta(delta) => text.push_str(&delta),
+                    CodexEvent::Completed => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(text, "fake response");
+        }
+        // Give the final recycle's reconnect a moment to write its PID line.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let pids: Vec<String> = std::fs::read_to_string(&pids_file)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let distinct: std::collections::HashSet<&String> = pids.iter().collect();
+        assert!(
+            distinct.len() >= 2,
+            "expected the child to be recycled at least once, saw pids: {pids:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
