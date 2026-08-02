@@ -1,6 +1,6 @@
 # Codex OpenAI Gateway
 
-An OpenAI-compatible Rust adapter backed by the locally authenticated Codex CLI. It exposes only `/health`, `/ready`, `/v1/models`, `/v1/chat/completions`, and `/v1/responses`; it is not an official OpenAI API implementation.
+An OpenAI-compatible Rust adapter backed by the locally authenticated Codex CLI. It exposes only `/health`, `/health/auth`, `/ready`, `/v1/models`, `/v1/chat/completions`, and `/v1/responses`; it is not an official OpenAI API implementation.
 
 Each request creates a fresh ephemeral internal Codex thread. Conversation continuity is supplied by the caller's `messages` or `input`; no workspace, `cwd`, project mount, thread ID, or Codex-native endpoint is public. Codex runs in `/home/codex/runtime` and may still have local tools available according to its installed configuration.
 
@@ -98,7 +98,7 @@ answer = client.chat.completions.create(
 print(answer.choices[0].message.content)
 ```
 
-This local-only build has no gateway authentication; `/health`, `/ready`, and `/v1/*` are public to anything that can reach the listener. Credentials, authorization headers, paths, and child stderr are not returned to clients. Keep the listener on localhost and do not expose it to an untrusted network.
+This local-only build has no gateway authentication; `/health`, `/health/auth`, `/ready`, and `/v1/*` are public to anything that can reach the listener. Credentials, authorization headers, paths, and child stderr are not returned to clients. Keep the listener on localhost and do not expose it to an untrusted network.
 
 ## Configuration and operations
 
@@ -106,10 +106,28 @@ Required for Compose: `CODEX_DEFAULT_MODEL` and pinned `CODEX_VERSION`. Optional
 
 The gateway keeps a pool of `CODEX_MAX_CONCURRENT_RUNS` persistent `codex app-server` children. Because the native app-server process accumulates memory across the turns it serves and never releases it while alive, each child is recycled after `CODEX_APP_SERVER_MAX_TURNS` turns (default `100`): while idle between runs the worker kills that child's process subtree and reconnects a fresh one, bounding the pool's resident memory. The recycle happens only between turns, never mid-turn, and the remaining pool workers keep `/ready` serving during the brief reconnect. Set `CODEX_APP_SERVER_MAX_TURNS=0` to disable recycling and keep every child alive for the whole process (the previous unbounded behavior).
 
+### Health probes
+
+Three separate signals, because a live process says nothing about a live credential — a pooled app-server child starts and answers normally with a dead token, so the gateway can 502 every request while looking perfectly healthy.
+
+| Endpoint | Answers | Fails when |
+| --- | --- | --- |
+| `/health` | is the process up? | never, while it can serve |
+| `/health/auth` | do the Codex credentials work? | token expired, or a turn was rejected on credentials |
+| `/ready` | can this instance serve traffic? | worker pool down **or** `/health/auth` red |
+
+`/health/auth` combines two signals. A turn that fails with a credential error latches immediately and the next successful turn clears it, so a revoked token is caught on the first request that hits it. Independently, `${CODEX_HOME}/auth.json` is inspected: Codex refreshes well before expiry, so an access token that is actually past `exp` proves the refresh path is broken — that catches a dead credential *before* a request pays for it. Neither probe calls OpenAI, so they cost no tokens and are safe at any interval. A `revoked` or `expired` status means run `codex login` on the host and restart the container so the pooled children reload `auth.json`.
+
+The image carries a `HEALTHCHECK` against `/health/auth`. Docker marks the container `unhealthy` but does not restart it, which is the behaviour you want: a restart cannot fix a revoked token, and it makes the outage visible in `docker ps` instead of silent.
+
+### Codex log database
+
+Codex writes tracing logs to `${CODEX_HOME}/logs_*.sqlite`. It prunes old rows but never returns the pages: the file is created with `auto_vacuum=INCREMENTAL`, which frees pages only when something issues `PRAGMA incremental_vacuum`, and Codex never does. Unattended it grows without bound while the live row count stays flat. Run `scripts/codex_log_maintenance.sh` (weekly from cron is plenty) to reclaim it; it checkpoints the WAL, releases the free pages in place, and reports what it recovered. It is safe to run while the gateway is up.
+
 Run checks with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all`. Real Codex smoke tests require valid host authentication; automated tests must use a fake Codex executable and never consume real usage.
 
 ## Troubleshooting
 
-If `/ready` returns `503`, inspect the container logs for a Codex startup or authentication problem and confirm that the host's `${HOME}/.codex` directory is mounted. The gateway does not print credentials or child stderr in HTTP responses. To verify a pinned CLI's exact app-server schema, run `codex app-server generate-json-schema --out /tmp/codex-schema` with that same CLI version.
+If `/ready` returns `503`, check `/health/auth` first to tell a credential failure apart from a backend one, then inspect the container logs for a Codex startup problem and confirm that the host's `${HOME}/.codex` directory is mounted. The gateway does not print credentials or child stderr in HTTP responses. To verify a pinned CLI's exact app-server schema, run `codex app-server generate-json-schema --out /tmp/codex-schema` with that same CLI version.
 
 Known limitations: this v1 adapter does not persist conversations, expose project files, accept generic file attachments, provide accurate token usage, or replay failed turns. Streaming request deadlines and disconnected clients cooperatively interrupt the active app-server turn; an interrupted or failed Codex turn is returned as an error rather than a successful completion. Image requests require the app-server backend; the text-only `codex exec` fallback rejects them.
