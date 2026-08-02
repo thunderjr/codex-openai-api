@@ -207,25 +207,114 @@ pub trait CodexBackend: Send + Sync {
 pub struct GatewayState {
     pub config: Config,
     pub backend: Arc<dyn CodexBackend>,
+    pub auth: Arc<AuthTracker>,
     permits: Arc<Semaphore>,
 }
 impl GatewayState {
     pub async fn start(config: Config) -> Result<Self, GatewayError> {
-        let backend = Arc::new(AppServerBackend::start(config.clone()).await?);
-        Ok(Self::with_backend(config, backend))
+        let auth = Arc::new(AuthTracker::default());
+        let backend = Arc::new(AppServerBackend::start(config.clone(), auth.clone()).await?);
+        Ok(Self {
+            permits: Arc::new(Semaphore::new(config.max_concurrent_runs)),
+            config,
+            backend,
+            auth,
+        })
     }
     pub fn with_backend(config: Config, backend: Arc<dyn CodexBackend>) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(config.max_concurrent_runs)),
             config,
             backend,
+            auth: Arc::new(AuthTracker::default()),
         }
     }
+}
+
+/// Live view of whether Codex credentials actually work.
+///
+/// A pooled app-server child starts and answers just fine with a dead token, so
+/// process-level readiness says nothing about whether a turn can reach OpenAI.
+/// This tracker is the missing signal: a turn that fails with an auth-shaped
+/// error latches here and the next successful turn clears it, so `/ready` and
+/// `/health/auth` go red the moment credentials break rather than staying green
+/// through a total outage.
+#[derive(Debug, Default)]
+pub struct AuthTracker {
+    // Unix seconds of the most recent successful turn; 0 when none has succeeded.
+    last_success: AtomicU64,
+    // Latched auth failure, cleared by the next success.
+    failure: RwLock<Option<AuthFailure>>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthFailure {
+    pub message: String,
+    pub at: u64,
+}
+impl AuthTracker {
+    pub async fn record_success(&self) {
+        self.last_success.store(unix_now(), Ordering::Relaxed);
+        // Only take the write lock when there is something to clear; successful
+        // turns are the hot path and normally leave this uncontended.
+        if self.failure.read().await.is_some() {
+            *self.failure.write().await = None;
+        }
+    }
+    pub async fn record_failure(&self, message: &str) {
+        if !is_auth_error(message) {
+            return;
+        }
+        tracing::warn!(error = %message, "turn failed on credentials; marking auth unhealthy");
+        *self.failure.write().await = Some(AuthFailure {
+            message: message.to_string(),
+            at: unix_now(),
+        });
+    }
+    pub async fn failure(&self) -> Option<AuthFailure> {
+        self.failure.read().await.clone()
+    }
+    pub async fn clear(&self) {
+        *self.failure.write().await = None;
+    }
+    pub fn last_success(&self) -> Option<u64> {
+        match self.last_success.load(Ordering::Relaxed) {
+            0 => None,
+            seconds => Some(seconds),
+        }
+    }
+}
+
+/// Does this backend error mean "the *account* credentials are bad" rather than
+/// "this one turn went wrong"? Deliberately narrow: a false positive marks the
+/// gateway unhealthy, so only phrasings unique to Codex account auth match.
+///
+/// Bare `401`/`unauthorized` are excluded on purpose. A configured MCP server
+/// with its own bearer token can fail a turn with exactly those words, and that
+/// says nothing about whether Codex can reach OpenAI.
+fn is_auth_error(message: &str) -> bool {
+    const AUTH_MARKERS: [&str; 6] = [
+        "refresh token",
+        "log out and sign in",
+        "access token could not be refreshed",
+        "invalid_api_key",
+        "incorrect api key",
+        "codex login",
+    ];
+    let message = message.to_ascii_lowercase();
+    AUTH_MARKERS.iter().any(|marker| message.contains(marker))
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 pub fn app(state: GatewayState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/health/auth", get(health_auth))
         .route("/ready", get(ready))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
@@ -237,17 +326,235 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 async fn ready(State(state): State<GatewayState>) -> Response {
-    if state.backend.ready() {
-        Json(json!({ "status": "ready", "backend": "app-server" })).into_response()
-    } else {
-        error_response(
+    if !state.backend.ready() {
+        return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "codex app-server is restarting",
             "backend_unavailable",
             None,
             None,
-        )
+        );
     }
+    // A live worker pool is necessary but not sufficient: children happily start
+    // with dead credentials, so readiness must also clear the auth check.
+    let auth = inspect_auth(&state).await;
+    if !auth.healthy() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            auth.message(),
+            "invalid_authentication",
+            None,
+            None,
+        );
+    }
+    Json(json!({ "status": "ready", "backend": "app-server", "auth": auth })).into_response()
+}
+async fn health_auth(State(state): State<GatewayState>) -> Response {
+    let auth = inspect_auth(&state).await;
+    let status = if auth.healthy() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(auth)).into_response()
+}
+
+/// Credential health, newest evidence first.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthReport {
+    /// `ok` | `unknown` | `revoked` | `expired` | `missing` | `unreadable`
+    pub status: &'static str,
+    /// `chatgpt` | `apikey` | `none`
+    pub mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_in_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_refresh: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_success: Option<u64>,
+}
+impl AuthReport {
+    /// `unknown` counts as healthy on purpose: an auth.json we cannot parse is a
+    /// reason to look, not a reason to pull a gateway that may be serving fine.
+    pub fn healthy(&self) -> bool {
+        matches!(self.status, "ok" | "unknown")
+    }
+    fn message(&self) -> String {
+        self.detail.clone().unwrap_or_else(|| match self.status {
+            "revoked" => "codex credentials were rejected; run `codex login`".into(),
+            "expired" => "codex access token expired and did not refresh; run `codex login`".into(),
+            "missing" => "no codex auth.json found; run `codex login`".into(),
+            other => format!("codex auth is {other}"),
+        })
+    }
+}
+
+/// Two independent signals, strongest first: a real turn that failed on
+/// credentials is ground truth, so it outranks anything the token file claims.
+/// The file check is what catches a stale token *before* the first request pays
+/// for it, which is the window a request-driven signal alone leaves open.
+async fn inspect_auth(state: &GatewayState) -> AuthReport {
+    // Start from the file so `mode` and the expiry fields stay populated either
+    // way, then let a real rejection override the verdict it reports.
+    let mut report = inspect_auth_file(&state.config.codex_home);
+    report.last_success = state.auth.last_success();
+    if let Some(failure) = state.auth.failure().await {
+        // `codex login` rewrites auth.json, so credentials newer than the latched
+        // failure mean it has already been addressed. Drop the latch rather than
+        // waiting for a successful turn to clear it: anything that pulls this
+        // instance on a red /ready would otherwise stop the very traffic needed
+        // to prove recovery, and the gateway could never come back on its own.
+        if auth_file_modified_after(&state.config.codex_home, failure.at) {
+            tracing::info!("credentials rewritten since the last failure; clearing auth latch");
+            state.auth.clear().await;
+        } else {
+            report.status = "revoked";
+            report.detail = Some(failure.message);
+        }
+    }
+    report
+}
+
+fn auth_file_modified_after(codex_home: &str, since: u64) -> bool {
+    std::fs::metadata(std::path::Path::new(codex_home).join("auth.json"))
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+        .is_some_and(|age| age.as_secs() > since)
+}
+
+fn inspect_auth_file(codex_home: &str) -> AuthReport {
+    let report = |status, mode, detail: Option<String>| AuthReport {
+        status,
+        mode,
+        detail,
+        expires_at: None,
+        expires_in_seconds: None,
+        last_refresh: None,
+        last_success: None,
+    };
+    let path = std::path::Path::new(codex_home).join("auth.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return report(
+            "missing",
+            "none",
+            Some(format!("{} is unreadable or absent", path.display())),
+        );
+    };
+    let Ok(auth): Result<Value, _> = serde_json::from_str(&raw) else {
+        return report(
+            "unreadable",
+            "none",
+            Some("auth.json is not valid JSON".into()),
+        );
+    };
+    let last_refresh = auth
+        .get("last_refresh")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // An API key never expires on its own, so presence is the whole check.
+    if auth
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return AuthReport {
+            last_refresh,
+            ..report("ok", "apikey", None)
+        };
+    }
+    let Some(access_token) = auth
+        .pointer("/tokens/access_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+    else {
+        return AuthReport {
+            last_refresh,
+            ..report(
+                "missing",
+                "none",
+                Some("auth.json has neither an API key nor an access token".into()),
+            )
+        };
+    };
+    let Some(expires_at) = jwt_expiry(access_token) else {
+        return AuthReport {
+            last_refresh,
+            ..report(
+                "unknown",
+                "chatgpt",
+                Some("access token carries no readable expiry".into()),
+            )
+        };
+    };
+    let expires_in = expires_at as i64 - unix_now() as i64;
+    // Codex refreshes well before expiry, so an actually-expired access token
+    // means the refresh path is broken — exactly the revoked-refresh-token case.
+    let (status, detail) = if expires_in <= 0 {
+        (
+            "expired",
+            Some(format!(
+                "codex access token expired {} ago and did not refresh; run `codex login`",
+                format_duration(-expires_in)
+            )),
+        )
+    } else {
+        ("ok", None)
+    };
+    AuthReport {
+        status,
+        mode: "chatgpt",
+        detail,
+        expires_at: Some(expires_at),
+        expires_in_seconds: Some(expires_in),
+        last_refresh,
+        last_success: None,
+    }
+}
+
+fn format_duration(seconds: i64) -> String {
+    match seconds {
+        s if s >= 86_400 => format!("{}d", s / 86_400),
+        s if s >= 3_600 => format!("{}h", s / 3_600),
+        s if s >= 60 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+/// Read `exp` out of a JWT payload without pulling in a base64 or JWT crate:
+/// the signature is irrelevant here since the token came from our own disk.
+fn jwt_expiry(token: &str) -> Option<u64> {
+    let payload = decode_base64url(token.split('.').nth(1)?)?;
+    serde_json::from_slice::<Value>(&payload)
+        .ok()?
+        .get("exp")
+        .and_then(Value::as_u64)
+}
+fn decode_base64url(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let (mut buffer, mut bits) = (0u32, 0u32);
+    for byte in input.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 async fn models(State(state): State<GatewayState>) -> Response {
     let mut data = vec![json!({
@@ -569,7 +876,7 @@ async fn run_chat(
                 "backend_unavailable",
                 None,
                 None,
-            )
+            );
         }
     };
     let id = format!("chatcmpl_{}", Uuid::new_v4().simple());
@@ -632,7 +939,13 @@ async fn run_chat(
         Err(_) => {
             tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), "chat request timed out");
             run.cancel.cancel();
-            error_response(StatusCode::GATEWAY_TIMEOUT, "request timed out", "timeout_error", None, None)
+            error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "request timed out",
+                "timeout_error",
+                None,
+                None,
+            )
         }
     }
 }
@@ -828,7 +1141,7 @@ async fn responses(
                 "backend_unavailable",
                 None,
                 None,
-            )
+            );
         }
     };
     let id = format!("resp_{}", Uuid::new_v4().simple());
@@ -891,7 +1204,13 @@ async fn responses(
         Err(_) => {
             tracing::warn!(%rid, elapsed_ms = started.elapsed().as_millis(), "responses request timed out");
             run.cancel.cancel();
-            error_response(StatusCode::GATEWAY_TIMEOUT, "request timed out", "timeout_error", None, None)
+            error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "request timed out",
+                "timeout_error",
+                None,
+                None,
+            )
         }
     }
 }
@@ -948,7 +1267,7 @@ pub struct AppServerBackend {
 }
 
 impl AppServerBackend {
-    async fn start(config: Config) -> Result<Self, GatewayError> {
+    async fn start(config: Config, auth: Arc<AuthTracker>) -> Result<Self, GatewayError> {
         // Pool of `max_concurrent_runs` workers, each owning one serial app-server child.
         // N children give N-way concurrency since a single child serializes its turns.
         let pool_size = config.max_concurrent_runs;
@@ -968,6 +1287,7 @@ impl AppServerBackend {
                 receiver,
                 ready_flag,
                 idle_tx.clone(),
+                auth.clone(),
             ));
         }
         tokio::spawn(dispatch(commands_rx, idle_rx, worker_senders));
@@ -1002,6 +1322,7 @@ async fn run_worker(
     mut receiver: mpsc::Receiver<BackendCommand>,
     ready: Arc<RwLock<bool>>,
     idle: mpsc::UnboundedSender<usize>,
+    auth: Arc<AuthTracker>,
 ) {
     let mut connection: Option<AppServerConnection> = None;
     let mut queue: VecDeque<ActiveRun> = VecDeque::new();
@@ -1064,7 +1385,7 @@ async fn run_worker(
                 None => break,
             },
             line = current_connection.lines.next() => match line {
-                Some(Ok(line)) => { if let Err(error) = handle_server_line(&mut current_connection.stdin, worker, &mut queue, &line).await { tracing::warn!(worker, error = %error, "app-server line handling failed, failing active runs and reconnecting"); fail_active(worker, &mut queue, error).await; connection_failed = true; } }
+                Some(Ok(line)) => { if let Err(error) = handle_server_line(&mut current_connection.stdin, worker, &mut queue, &line, &auth).await { tracing::warn!(worker, error = %error, "app-server line handling failed, failing active runs and reconnecting"); fail_active(worker, &mut queue, error).await; connection_failed = true; } }
                 Some(Err(error)) => { tracing::warn!(worker, error = %error, "app-server line stream error, failing active runs and reconnecting"); fail_active(worker, &mut queue, GatewayError::Backend(error.to_string())).await; connection_failed = true; }
                 None => { tracing::warn!(worker, "app-server stdout closed (EOF), failing active runs and reconnecting"); fail_active(worker, &mut queue, GatewayError::Unavailable).await; connection_failed = true; }
             },
@@ -1114,7 +1435,12 @@ async fn run_worker(
             // alive, so killing it here and reconnecting a fresh one on the next
             // loop iteration bounds the pool's footprint. Reconnecting resets the
             // readiness flag briefly, but the other pool workers keep `ready()` true.
-            tracing::info!(worker, turns_served, max_turns, "recycling app-server child after reaching turn budget");
+            tracing::info!(
+                worker,
+                turns_served,
+                max_turns,
+                "recycling app-server child after reaching turn budget"
+            );
             if let Some(pid) = current_connection.child.id() {
                 kill_subtree(pid, true);
             }
@@ -1153,7 +1479,10 @@ impl CodexBackend for AppServerBackend {
         // single subtree sweep from our own pid reaps the entire pool without
         // touching the gateway itself.
         let count = self.ready.len();
-        tracing::info!(pool_size = count, "shutting down: killing app-server process subtree");
+        tracing::info!(
+            pool_size = count,
+            "shutting down: killing app-server process subtree"
+        );
         kill_subtree(std::process::id(), false);
     }
 }
@@ -1282,6 +1611,7 @@ async fn handle_server_line(
     worker: usize,
     queue: &mut VecDeque<ActiveRun>,
     line: &str,
+    auth: &AuthTracker,
 ) -> Result<(), GatewayError> {
     let value: Value = serde_json::from_str(line)
         .map_err(|_| GatewayError::Backend("invalid app-server JSON".into()))?;
@@ -1339,7 +1669,9 @@ async fn handle_server_line(
                 .and_then(Value::as_str)
                 .unwrap_or("<none>");
             let input_tokens = params.pointer("/usage/inputTokens").and_then(Value::as_u64);
-            let output_tokens = params.pointer("/usage/outputTokens").and_then(Value::as_u64);
+            let output_tokens = params
+                .pointer("/usage/outputTokens")
+                .and_then(Value::as_u64);
             tracing::info!(worker, thread_id = ?active.thread_id, turn_id = ?active.turn_id, status, ?input_tokens, ?output_tokens, ?turn_elapsed_ms, "turn/completed");
             if let Some(usage) = params.get("usage") {
                 let _ = active
@@ -1352,6 +1684,7 @@ async fn handle_server_line(
             }
             match params.pointer("/turn/status").and_then(Value::as_str) {
                 Some("completed") => {
+                    auth.record_success().await;
                     let _ = active.events.send(Ok(CodexEvent::Completed)).await;
                 }
                 Some("interrupted") => {
@@ -1365,6 +1698,7 @@ async fn handle_server_line(
                         .pointer("/turn/error/message")
                         .and_then(Value::as_str)
                         .unwrap_or("Codex turn failed");
+                    auth.record_failure(message).await;
                     let _ = active
                         .events
                         .send(Ok(CodexEvent::Failed(message.into())))
@@ -1541,7 +1875,10 @@ mod tests {
         };
         let alive = |pid: u32| unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
         assert!(alive(shim_pid), "shim should be alive before kill");
-        assert!(alive(grandchild_pid), "grandchild should be alive before kill");
+        assert!(
+            alive(grandchild_pid),
+            "grandchild should be alive before kill"
+        );
 
         kill_subtree(shim_pid, true);
         let _ = shim.wait();
@@ -1768,6 +2105,238 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
+    /// Build an unsigned JWT whose `exp` sits `offset` seconds from now. Only the
+    /// payload matters: `jwt_expiry` never verifies the signature.
+    fn token_expiring_in(offset: i64) -> String {
+        fn segment(raw: &str) -> String {
+            const ALPHABET: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let bytes = raw.as_bytes();
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let mut buffer = [0u8; 3];
+                buffer[..chunk.len()].copy_from_slice(chunk);
+                let packed = u32::from_be_bytes([0, buffer[0], buffer[1], buffer[2]]);
+                for index in 0..chunk.len() + 1 {
+                    let shift = 18 - index * 6;
+                    out.push(ALPHABET[((packed >> shift) & 0x3f) as usize] as char);
+                }
+            }
+            out
+        }
+        let exp = unix_now() as i64 + offset;
+        format!(
+            "header.{}.signature",
+            segment(&format!(r#"{{"exp":{exp}}}"#))
+        )
+    }
+    fn auth_home(name: &str, auth_json: &str) -> std::path::PathBuf {
+        static UNIQUE: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "codex_auth_{name}_{}_{}",
+            std::process::id(),
+            UNIQUE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("auth.json"), auth_json).unwrap();
+        dir
+    }
+    /// Push a file's mtime into the past so latch-vs-file ordering is exact
+    /// rather than racing on same-second timestamps.
+    fn backdate(path: &std::path::Path, seconds_ago: i64) {
+        let when = unix_now() as i64 - seconds_ago;
+        let stamp = libc::timeval {
+            tv_sec: when as libc::time_t,
+            tv_usec: 0,
+        };
+        let raw = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::utimes(raw.as_ptr(), [stamp, stamp].as_ptr()) },
+            0
+        );
+    }
+
+    #[test]
+    fn auth_file_check_catches_a_token_that_stopped_refreshing() {
+        // The outage shape: a ChatGPT token whose refresh silently stopped, so the
+        // access token aged past its expiry while every probe still said healthy.
+        let dir = auth_home(
+            "expired",
+            &format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{}"}},"last_refresh":"2026-07-20T17:43:32Z"}}"#,
+                token_expiring_in(-172_800)
+            ),
+        );
+        let report = inspect_auth_file(dir.to_str().unwrap());
+        assert_eq!(report.status, "expired");
+        assert_eq!(report.mode, "chatgpt");
+        assert!(!report.healthy());
+        assert_eq!(report.last_refresh.as_deref(), Some("2026-07-20T17:43:32Z"));
+        assert!(report.detail.unwrap().contains("2d"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn auth_file_check_passes_a_live_token_and_an_api_key() {
+        let live = auth_home(
+            "live",
+            &format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{}"}}}}"#,
+                token_expiring_in(86_400)
+            ),
+        );
+        let report = inspect_auth_file(live.to_str().unwrap());
+        assert_eq!(report.status, "ok");
+        assert!(report.healthy());
+        assert!(report.expires_in_seconds.unwrap() > 0);
+
+        // API keys carry no expiry, so presence alone is the whole check.
+        let keyed = auth_home(
+            "keyed",
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-test"}"#,
+        );
+        let report = inspect_auth_file(keyed.to_str().unwrap());
+        assert_eq!(report.status, "ok");
+        assert_eq!(report.mode, "apikey");
+        assert!(report.healthy());
+
+        // A missing file is a hard fail; unparseable JSON is only "look at me".
+        let absent = inspect_auth_file("/nonexistent/codex/home");
+        assert_eq!(absent.status, "missing");
+        assert!(!absent.healthy());
+        let garbled = auth_home("garbled", "not json at all");
+        assert!(!inspect_auth_file(garbled.to_str().unwrap()).healthy());
+
+        for dir in [live, keyed, garbled] {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn auth_tracker_latches_credential_failures_but_ignores_ordinary_ones() {
+        let tracker = AuthTracker::default();
+        assert!(tracker.failure().await.is_none());
+        assert!(tracker.last_success().is_none());
+
+        // A normal turn failure must not take the gateway out of rotation.
+        tracker.record_failure("model produced no output").await;
+        tracker.record_failure("request timed out").await;
+        assert!(tracker.failure().await.is_none());
+
+        // An MCP server with its own bearer token can fail a turn with a 401 that
+        // says nothing about the Codex account, so those must not latch either.
+        tracker
+            .record_failure("mcp server n8n-mcp returned 401 Unauthorized")
+            .await;
+        assert!(
+            tracker.failure().await.is_none(),
+            "a tool-level 401 must not mark account credentials dead"
+        );
+
+        tracker
+            .record_failure(
+                "Your access token could not be refreshed because your refresh token was revoked.",
+            )
+            .await;
+        let failure = tracker.failure().await.expect("credential failure latches");
+        assert!(failure.message.contains("refresh token was revoked"));
+
+        // Recovery is self-healing: the next good turn clears the latch.
+        tracker.record_success().await;
+        assert!(tracker.failure().await.is_none());
+        assert!(tracker.last_success().is_some());
+    }
+    #[tokio::test]
+    async fn ready_and_health_auth_go_red_once_credentials_are_rejected() {
+        let dir = auth_home(
+            "probe",
+            &format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{}"}}}}"#,
+                token_expiring_in(86_400)
+            ),
+        );
+        let mut config = config();
+        config.codex_home = dir.to_str().unwrap().to_string();
+        let state = GatewayState::with_backend(config, Arc::new(FakeBackend));
+        let router = app(state.clone());
+
+        let probe = |path: &'static str| {
+            let router = router.clone();
+            async move {
+                router
+                    .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+
+        // Healthy credentials: liveness, readiness and the auth probe all pass.
+        assert_eq!(probe("/health").await, StatusCode::OK);
+        assert_eq!(probe("/ready").await, StatusCode::OK);
+        assert_eq!(probe("/health/auth").await, StatusCode::OK);
+
+        // A turn rejected on credentials must flip readiness even though the
+        // worker pool is still perfectly alive — the bug this endpoint exists for.
+        state
+            .auth
+            .record_failure("Your refresh token was revoked. Please log out and sign in again.")
+            .await;
+        assert_eq!(
+            probe("/health").await,
+            StatusCode::OK,
+            "liveness is unaffected"
+        );
+        assert_eq!(probe("/ready").await, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(probe("/health/auth").await, StatusCode::SERVICE_UNAVAILABLE);
+
+        state.auth.record_success().await;
+        assert_eq!(probe("/ready").await, StatusCode::OK);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[tokio::test]
+    async fn re_login_clears_the_latch_without_needing_a_successful_turn() {
+        // Recovery must not depend on traffic: if a red /ready pulls this instance
+        // out of rotation, no turn can ever succeed to clear the latch, so a fresh
+        // auth.json has to be enough on its own.
+        let dir = auth_home(
+            "relogin",
+            &format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{}"}}}}"#,
+                token_expiring_in(86_400)
+            ),
+        );
+        let mut config = config();
+        config.codex_home = dir.to_str().unwrap().to_string();
+        let state = GatewayState::with_backend(config, Arc::new(FakeBackend));
+
+        // Credentials predate the failure, so the latch stands.
+        backdate(&dir.join("auth.json"), 120);
+        state
+            .auth
+            .record_failure("refresh token was revoked; run `codex login`")
+            .await;
+        {
+            let mut failure = state.auth.failure.write().await;
+            failure.as_mut().unwrap().at = unix_now() - 60;
+        }
+        assert!(!inspect_auth(&state).await.healthy());
+
+        // Simulate `codex login` rewriting the credential file.
+        std::fs::write(
+            dir.join("auth.json"),
+            format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{}"}}}}"#,
+                token_expiring_in(86_400)
+            ),
+        )
+        .unwrap();
+
+        assert!(inspect_auth(&state).await.healthy());
+        assert!(
+            state.auth.failure().await.is_none(),
+            "the latch itself must be dropped, not just reported around"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     #[tokio::test]
     async fn public_routes_return_openai_shaped_payloads() {
         let router = app(GatewayState::with_backend(config(), Arc::new(FakeBackend)));
@@ -1866,7 +2435,9 @@ mod tests {
     async fn fake_app_server_protocol_round_trip() {
         let mut config = config();
         config.codex_binary = format!("{}/tests/fake_codex.sh", env!("CARGO_MANIFEST_DIR"));
-        let backend = AppServerBackend::start(config).await.unwrap();
+        let backend = AppServerBackend::start(config, Arc::new(AuthTracker::default()))
+            .await
+            .unwrap();
         for _ in 0..20 {
             if backend.ready() {
                 break;
@@ -1903,7 +2474,9 @@ mod tests {
         config.max_concurrent_runs = 2;
         config.exec_fallback = false;
         config.codex_binary = format!("{}/tests/fake_codex_slow.sh", env!("CARGO_MANIFEST_DIR"));
-        let backend = AppServerBackend::start(config).await.unwrap();
+        let backend = AppServerBackend::start(config, Arc::new(AuthTracker::default()))
+            .await
+            .unwrap();
         for _ in 0..200 {
             if backend.ready() {
                 break;
@@ -1945,11 +2518,20 @@ mod tests {
         assert_eq!(text1, "fake response");
         assert_eq!(text2, "fake response");
         // Each run genuinely waited out the ~600ms turn delay...
-        assert!(elapsed1 >= Duration::from_millis(500), "run1 too fast: {elapsed1:?}");
-        assert!(elapsed2 >= Duration::from_millis(500), "run2 too fast: {elapsed2:?}");
+        assert!(
+            elapsed1 >= Duration::from_millis(500),
+            "run1 too fast: {elapsed1:?}"
+        );
+        assert!(
+            elapsed2 >= Duration::from_millis(500),
+            "run2 too fast: {elapsed2:?}"
+        );
         // ...yet the two together finished in less than their sum, which is only
         // possible if they ran on separate children concurrently (serial would be ~1200ms).
-        assert!(total < Duration::from_millis(1000), "runs did not overlap: {total:?}");
+        assert!(
+            total < Duration::from_millis(1000),
+            "runs did not overlap: {total:?}"
+        );
     }
     #[tokio::test]
     async fn app_server_child_is_recycled_after_turn_budget() {
@@ -1973,7 +2555,9 @@ mod tests {
         config.timeout_seconds = 10;
         config.codex_home = dir.to_str().unwrap().to_string();
         config.codex_binary = format!("{}/tests/fake_codex_pid.sh", env!("CARGO_MANIFEST_DIR"));
-        let backend = AppServerBackend::start(config).await.unwrap();
+        let backend = AppServerBackend::start(config, Arc::new(AuthTracker::default()))
+            .await
+            .unwrap();
         for _ in 0..200 {
             if backend.ready() {
                 break;
