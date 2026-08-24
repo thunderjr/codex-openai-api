@@ -22,6 +22,11 @@ services:
       - ${HOST_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/host-ca-certificates.crt:ro
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     restart: unless-stopped
+    # Pinned resolvers: on reboot this container can start before dhcpcd writes
+    # the host resolv.conf, freezing an empty resolver into the container.
+    dns:
+      - 192.168.10.1
+      - 1.1.1.1
     networks:
       - external
 
